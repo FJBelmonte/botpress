@@ -49,9 +49,7 @@ interface State {
   selectedChannel: string
   shownSection: string
   disableAnalyticsFetching?: boolean
-  qnaQuestions: {
-    [id: string]: string
-  }
+  topQnaQuestions: { id: string; question?: string; count: number }[]
 }
 
 interface ExportPeriod {
@@ -129,10 +127,10 @@ const fetchReducer = (state: State, action): State => {
       dateRange,
       disableAnalyticsFetching: true
     }
-  } else if (action.type === 'receivedQnaQuestions') {
+  } else if (action.type === 'receivedTopQnaQuestions') {
     return {
       ...state,
-      qnaQuestions: action.data.qnaQuestions
+      topQnaQuestions: action.data.topQnaQuestions
     }
   } else {
     throw new Error(`That action type isn't supported.`)
@@ -144,7 +142,7 @@ const defaultChannels = [
   { value: 'api', label: lang.tr('module.analytics.channels.api') }
 ]
 
-const qnaQuestionsCache = {}
+const qnaQuestionsCache = { found: {}, notFound: new Set<string>() }
 
 const Analytics: FC<any> = ({ bp }) => {
   const loadJson = useRef(null)
@@ -158,7 +156,7 @@ const Analytics: FC<any> = ({ bp }) => {
     pageTitle: lang.tr('module.analytics.dashboard'),
     selectedChannel: defaultChannels[0].value,
     shownSection: 'dashboard',
-    qnaQuestions: {}
+    topQnaQuestions: []
   })
 
   useEffect(() => {
@@ -218,29 +216,41 @@ const Analytics: FC<any> = ({ bp }) => {
   }
 
   const fetchQnaQuestions = async () => {
-    const qnaIds = orderMetrics(getMetric('msg_sent_qna_count'))
-      .filter(m => m.name)
-      .slice(0, 10)
-      .map(m => m.name)
+    const metrics = orderMetrics(getMetric('msg_sent_qna_count').filter(metric => metric.subMetric)).slice(0, 10)
 
-    const fetchedQuestions = await Promise.all(
-      qnaIds.filter(id => !(id in qnaQuestionsCache)).map(id => fetchQnaQuestion(id.replace('__qna__', '')))
+    const topQnaQuestions = await Promise.all(
+      metrics.map(async ({ name: id, count }) => {
+        if (id in qnaQuestionsCache.found) {
+          return { count, id, question: qnaQuestionsCache.found[id] }
+        }
+
+        if (qnaQuestionsCache.notFound.has(id)) {
+          return { count, id }
+        }
+
+        let response
+        try {
+          response = await fetchQnaQuestion(id.replace('__qna__', ''))
+        } catch (e) {
+          qnaQuestionsCache.notFound.add(id)
+          return { count, id }
+        }
+
+        const {
+          data: { questions }
+        } = response
+        const question = (questions[lang.getLocale()] ||
+          questions[lang.defaultLocale] ||
+          Object.values(questions)[0])[0]
+        qnaQuestionsCache.found[id] = question
+        return { count, id, question }
+      })
     )
 
-    for (const {
-      data: { questions },
-      id
-    } of fetchedQuestions) {
-      const question = questions[lang.getLocale()] || questions[lang.defaultLocale] || Object.values(questions)[0]
-      qnaQuestionsCache[`__qna__${id}`] = question[0]
-    }
-
-    const qnaQuestions = qnaIds.reduce((acc, id) => {
-      acc[id] = qnaQuestionsCache[id]
-      return acc
-    }, {})
-
-    dispatch({ type: 'receivedQnaQuestions', data: { qnaQuestions } })
+    dispatch({
+      type: 'receivedTopQnaQuestions',
+      data: { topQnaQuestions }
+    })
   }
 
   const fetchQnaQuestion = async (id: string): Promise<any> => {
@@ -406,23 +416,38 @@ const Analytics: FC<any> = ({ bp }) => {
           itemLimit={10}
           className={cx(style.genericMetric, style.half, style.list)}
         />
-        {!_.isEmpty(state.qnaQuestions) && (
-          <ItemsList
-            name={lang.tr('module.analytics.mostAskedQuestions')}
-            items={getTopItems('msg_sent_qna_count', 'qna', {
-              nameRenderer: id => state.qnaQuestions[id],
-              // Filter out QnA metrics without submetric (legacy)
-              filter: metric => metric.subMetric
-            })}
-            className={cx(style.genericMetric, style.half, style.list)}
-          />
-        )}
+        <ItemsList
+          name={lang.tr('module.analytics.mostAskedQuestions')}
+          items={state.topQnaQuestions.map(q => ({
+            count: q.count,
+            label: q.question || renderDeletedQna(q.id),
+            onClick: q.question ? navigateToElement(q.id, 'qna') : undefined
+          }))}
+          className={cx(style.genericMetric, style.half, style.list)}
+        />
       </div>
     )
   }
 
+  const renderDeletedQna = (id: string) =>
+    `[${lang.tr('module.analytics.deletedQna')}, ID: ${id.replace(`__qna__`, '')}]`
+
+  const getLanguagesData = () => {
+    const metrics = state.metrics.filter(m => m.metric === 'msg_nlu_language')
+    if (metrics.length === 0) {
+      return []
+    }
+
+    const total = _.sum(metrics.map(m => m.value))
+
+    return _.sortBy(metrics, m => m.value)
+      .reverse()
+      .map(m => ({ value: getNotNaN((m.value / total) * 100, '%'), language: m.subMetric }))
+  }
+
   const renderHandlingUnderstanding = () => {
-    const { total, inside, outside } = getMisunderStoodData()
+    const misunderstood = getMisunderStoodData()
+    const languages = getLanguagesData()
     const positiveFeedback = getMetricCount('feedback_positive_qna')
     const negativeFeedback = getMetricCount('feedback_negative_qna')
     const positivePct = Math.round((positiveFeedback / (positiveFeedback + negativeFeedback)) * 100)
@@ -431,12 +456,34 @@ const Analytics: FC<any> = ({ bp }) => {
       <div className={cx(style.metricsContainer, style.fullWidth)}>
         <div className={cx(style.genericMetric, style.quarter)}>
           <div>
-            <p className={style.numberMetricValue}>{total}</p>
+            <p className={style.numberMetricValue}>{misunderstood.total}</p>
             <h3 className={style.metricName}>{lang.tr('module.analytics.misunderstoodMessages')}</h3>
           </div>
           <div>
-            <FlatProgressChart value={inside} color="#DE4343" name={`${inside} inside flows`} />
-            <FlatProgressChart value={outside} color="#F2B824" name={`${outside} outside flows`} />
+            <FlatProgressChart
+              value={misunderstood.inside}
+              color="#DE4343"
+              name={`${misunderstood.inside} inside flows`}
+            />
+            <FlatProgressChart
+              value={misunderstood.outside}
+              color="#F2B824"
+              name={`${misunderstood.outside} outside flows`}
+            />
+          </div>
+        </div>
+        <div className={cx(style.genericMetric, style.quarter)}>
+          <div>
+            <h3 className={style.metricName}>{lang.tr('module.analytics.messagesByLanguage')}</h3>
+          </div>
+          <div>
+            {languages.map(i => (
+              <FlatProgressChart
+                value={i.value}
+                color="#F2B824"
+                name={`${lang.tr(`isoLangs.${i.language}.name`)}: ${i.value}`}
+              />
+            ))}
           </div>
         </div>
         {isNDU && (
